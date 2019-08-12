@@ -22,6 +22,6 @@ To dismount and lock the drives: `crypt-drive.sh --config=./crypt-drive.config l
 ## Todo
 
 - [x] Unlock with keyfiles encrypted and stored in a separate filesystem (USB device or regular file)
-- [ ] Unlock when the header is stored in a separate file (with cryptsetup --header)
+- [x] Unlock when the header is stored in a separate file (with cryptsetup --header)
 - [ ] Allow to unlock all drives with password
 - [ ] Unlock hidden volumes (with cryptsetup --align-payload)
