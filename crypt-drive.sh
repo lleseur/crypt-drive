@@ -33,7 +33,7 @@ keyfile_partition='/tmp/key'
 # Key partition mount parameters
 usb_mount_param='-o ro'
 # Override key file path
-# Default key file path is "${mount_dir}/key/key-${device_name}-level${n}.key" for the n-th level of encryption
+# Default key file path is "${mount_dir}/key/key-${device_name}-level${n}" for the n-th level of encryption
 keyfile_path_override=''
 
 # List of encrypted devices to unlock, space separated
@@ -43,13 +43,23 @@ device_list='/tmp/disk1 /tmp/disk2'
 device_name="crypt"
 
 # How many encryption layer
-luks_level=1
+luks_level=2
 
 # Merge filesystem with mergerfs
 merge=0 # Boolean to enable mergerfs
 merge_mount_dir='/mnt/crypt/merger'
 # MergerFS mount options
 merger_mount_param=''
+
+# Separate header configuration
+separate_header_drives=0 # Boolean
+# Drive headers location
+# Default is "${mount_dir}/key/header-${device_name}-drive${n}-level${m}" for the n-th drive, n-th level
+separate_header_drive_path_override=''
+separate_header_key=0 # Boolean
+# Keyfile header location
+# Default will ask during execution
+separate_header_key_path_override=''
 
 # Default values
 force=0
@@ -84,14 +94,26 @@ CHECK_CONFIG ()
 
 
 	# Test if all devices are LUKS encrypted and if their mountpoint exists
+	# If hardcoded separate header
+	if [ ${separate_header_drives} -eq 1 ] && [ -n "${separate_header_drive_path_override}" ]
+	then
+		header_cmdline="--header \"${separate_header_drive_path_override}\""
+	else
+		header_cmdline=''
+	fi
 	count=0
 	for i in ${device_list}
 	do
 		count=$((count+1))
-		if ! cryptsetup isLuks "${i}"
+
+		# If we have the header, test if drive is LUKS encrypted
+		if { [ ${separate_header_drives} -ne 1 ] || { [ ${separate_header_drives} -eq 1 ] && [ -n "${separate_header_drive_path_override}" ]; }; }
 		then
-			echo "${i} is not a LUKS device" | STDERR
-			if [ ${force} -ne 1 ]; then return 4; fi
+			if ! eval cryptsetup isLuks "${header_cmdline}" "${i}"
+			then
+				echo "${i} is not a LUKS device" | STDERR
+				if [ ${force} -ne 1 ]; then return 4; fi
+			fi
 		fi
 
 		# If mount in multi mode, need directory for each drive
@@ -125,11 +147,7 @@ CHECK_CONFIG ()
 		fi
 	fi
 
-	if ! cryptsetup isLuks "${keyfile_partition}"
-	then
-		echo "${keyfile_partition} is not a LUKS device" | STDERR
-		if [ ${force} -ne 1 ]; then return 4; fi
-	fi
+	# Keyfile mountpoint test
 	if ! [ -d "${mount_dir}/key" ] || [ -n "$(ls -A ${mount_dir}/key)" ]
 	then
 		if ! mkdir "${mount_dir}/key"
@@ -139,6 +157,7 @@ CHECK_CONFIG ()
 		fi
 	fi
 
+	# Merge mountpoint test
 	if [ ${merge} -eq 1 ]
 	then
 		if [ ! -d "${merge_mount_dir}" ] || [ -n "$(ls -A \"${merge_mount_dir}\")" ]
@@ -151,13 +170,52 @@ CHECK_CONFIG ()
 		fi
 	fi
 
+	# Keyfile separate header test for override
+	if [ ${separate_header_key} -eq 1 ] && [ -n "${separate_header_key_path_override}" ]
+	then
+		if [ ! -f "${separate_header_key_path_override}" ]
+		then
+			echo "${separate_header_key_path_override} does not exists or is not a regular file" | STDERR
+			return 17 # Cannot ignore
+		else
+			# Test if keyfile is LUKS partition
+			if ! cryptsetup isLuks --header "${separate_header_key_path_override}" "${keyfile_partition}"
+			then
+				echo "${keyfile_partition} is not a LUKS device" | STDERR
+				if [ ${force} -ne 1 ]; then return 4; fi
+			fi
+		fi
+	fi
+	# If no separate header, test if keyfile is LUKS partition
+	if [ ${separate_header_key} -ne 1 ]
+	then
+		if ! cryptsetup isLuks "${keyfile_partition}"
+		then
+			echo "${keyfile_partition} is not a LUKS device" | STDERR
+			if [ ${force} -ne 1 ]; then return 4; fi
+		fi
+	fi
+
 	return 0
 }
 
 MOUNT_KEY ()
 {
+	# If separate header, get keyfile header
+	if [ ${separate_header_key} -eq 1 ]
+	then
+		if [ -n "${separate_header_key_path_override}" ]
+		then
+			header_cmdline="--header \"${separate_header_key_path_override}\""
+		else
+			printf 'Enter the level 1 header path for keyfile: '
+			read -r separate_header_key_path
+			header_cmdline="--header \"${separate_header_key_path}\""
+		fi
+	fi
+
 	# First level unlock
-	if ! cryptsetup luksOpen "${keyfile_partition}" "${device_name}-key-level1"
+	if ! eval cryptsetup luksOpen "${header_cmdline}" "${keyfile_partition}" "${device_name}-key-level1"
 	then
 		echo "Could not open ${keyfile_partition} with name ${device_name}-key-level1" | STDERR
 		if [ ${force} -ne 1 ]; then return 6; fi
@@ -165,8 +223,16 @@ MOUNT_KEY ()
 	level_count=1
 	while [ ${level_count} -ne ${luks_level} ]
 	do
+		# If separate header, get keyfile header
+		if [ ${separate_header_key} -eq 1 ] && [ -z "${separate_header_key_path_override}" ]
+		then
+			printf 'Enter the level %s header path for keyfile: ' "$((level_count+1))"
+			read -r separate_header_key_path
+			header_cmdline="--header \"${separate_header_key_path}\""
+		fi
+
 		# Unlock level $level_count
-		if ! cryptsetup luksOpen "/dev/mapper/${device_name}-key-level${level_count}" "${device_name}-key-level$((level_count+1))"
+		if ! eval cryptsetup luksOpen "${header_cmdline}" "/dev/mapper/${device_name}-key-level${level_count}" "${device_name}-key-level$((level_count+1))"
 		then
 			echo "Could not open /dev/mapper/${device_name}-key-level${level_count} with name ${device_name}-key-level$((level_count+1))" | STDERR
 			if [ ${force} -ne 1 ]; then return 6; fi
@@ -190,7 +256,7 @@ MOUNT_KEY ()
 		# Get key file path
 		if [ -z "${keyfile_path_override}" ]
 		then
-			keyfile_path="${mount_dir}/key/key-${device_name}-level${level_count}.key"
+			keyfile_path="${mount_dir}/key/key-${device_name}-level${level_count}"
 		else
 			keyfile_path="${keyfile_path_override}"
 		fi
@@ -209,6 +275,12 @@ MOUNT_KEY ()
 
 MOUNT_DRIVES ()
 {
+	# If separate header, get keyfile header
+	if [ ${separate_header_key} -eq 1 ] && [ -n "${separate_header_drive_path_override}" ]
+	then
+		header_cmdline="--header \"${separate_header_drive_path_override}\""
+	fi
+
 	# Unlock and mount each drives
 	drive_count=1
 	for drive in ${device_list}
@@ -216,13 +288,19 @@ MOUNT_DRIVES ()
 		# Get key file path
 		if [ -z "${keyfile_path_override}" ]
 		then
-			keyfile_path="${mount_dir}/key/key-${device_name}-level1.key"
+			keyfile_path="${mount_dir}/key/key-${device_name}-level1"
 		else
 			keyfile_path="${keyfile_path_override}"
 		fi
 
+		# Find header path if separate header and no override
+		if [ ${separate_header_key} -eq 1 ] && [ -z "${separate_header_drive_path_override}" ]
+		then
+			header_cmdline="--header \"${mount_dir}/key/header-${device_name}-drive${drive_count}-level1\""
+		fi
+
 		# First level unlock
-		if ! cryptsetup -d "${keyfile_path}" luksOpen "${drive}" "${device_name}-drive${drive_count}-level1"
+		if ! eval cryptsetup -d "${keyfile_path}" "${header_cmdline}" luksOpen "${drive}" "${device_name}-drive${drive_count}-level1"
 		then
 			echo "Could not open ${drive} with name ${device_name}-drive${drive_count}-level1" | STDERR
 			if [ ${force} -ne 1 ]; then return 9; fi
@@ -235,13 +313,19 @@ MOUNT_DRIVES ()
 			# Get key file path
 			if [ -z "${keyfile_path_override}" ]
 			then
-				keyfile_path="${mount_dir}/key/key-${device_name}-level$((level_count+1)).key"
+				keyfile_path="${mount_dir}/key/key-${device_name}-level$((level_count+1))"
 			else
 				keyfile_path="${keyfile_path_override}"
 			fi
 
+			# Find header path if separate header and no override
+			if [ ${separate_header_key} -eq 1 ] && [ -z "${separate_header_drive_path_override}" ]
+			then
+				header_cmdline="--header \"${mount_dir}/key/header-${device_name}-drive${drive_count}-level$((level_count+1))\""
+			fi
+
 			# Unlock level $level_count
-			if ! cryptsetup -d "${keyfile_path}" luksOpen "/dev/mapper/${device_name}-drive${drive_count}-level${level_count}" "${device_name}-drive${drive_count}-level$((level_count+1))"
+			if ! eval cryptsetup -d "${keyfile_path}" "${header_cmdline}" luksOpen "/dev/mapper/${device_name}-drive${drive_count}-level${level_count}" "${device_name}-drive${drive_count}-level$((level_count+1))"
 			then
 				echo "Could not open /dev/mapper/${device_name}-drive${drive_count}-level${level_count} with name ${device_name}-drive${drive_count}-level$((level_count+1))" | STDERR
 				if [ ${force} -ne 1 ]; then return 9; fi
@@ -340,6 +424,12 @@ UNMERGE ()
 
 UMOUNT_DRIVES ()
 {
+	# If force mode, dismount and lock the key
+	if [ ${force} -eq 1 ] && ! UMOUNT_KEY
+	then
+		echo 'Could not dismount the key' | STDERR
+	fi
+
 	# If mounted in single mode, umount only one drive
 	if [ "${mount_type}" = "single" ]
 	then
@@ -507,6 +597,26 @@ Parameters:
 	-h, --help		Show this help message
 	-f, --force		Try to ignore errors
 	-c, --config	Config file path (example: "-c /path/crypt-drive.config" or "--config=/path/crypt-drive.config")
+Return codes:
+	1	Need root permission (cannot ignore)
+	2	Cannot create directory for mountpoints (cannot ignore)
+	4	Device is not LUKS
+	5	Mountpoint is not a directory or is not empty
+	6	Cannot open keyfile partition with cryptsetup
+	7	Cannot mount unlocked keyfile
+	8	Keyfile does not exists, cannot unlock (cannot ignore)
+	9	Cannot unlock drive
+	10	Cannot mount unlocked drive
+	11	Cannot mount MergerFS
+	12	Cannot dismount keyfile
+	13	Cannot lock keyfile
+	14	Cannot dismount MergerFS
+	15	Cannot dismount drive
+	16	Cannot lock drive
+	17	Keyfile LUKS header path override does not exists or is not a regular file (cannot ignore)
+
+Warning:
+	MergerFS functionality has NOT been tested
 EOF
 # Debug
 elif [ ${action} -eq 5 ]
